@@ -11,20 +11,16 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Global Headers (no cookies here) ---
-BASE_HEADERS = {
-    'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+# --- Headers ---
+HEADERS = {
+    'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
     'Accept': "application/json, text/plain, */*",
     'Accept-Encoding': "identity",
     'X-Requested-With': "XMLHttpRequest",
     'Content-Type': "application/x-www-form-urlencoded",
-    'Accept-Language': "en-GB,en-US;q=0.9,en;q=0.8",
 }
 
-# ------------------------------
-# Premium Cookies
-# ------------------------------
+# --- Premium Cookies ---
 PREMIUM_COOKIES = {
     "ACCOUNT_CHOOSER": "AFx_qI5jWZXx28jIOPcT_ElaPSEZHiA3QVBlE-lkByZzewQ4Mhibrq6ceJjPhODR_LezJHsGL40832prtO7X1NhxFKHOSBGLlaWjCgAFT-X1Vo6eMuefkWdDATDzanzyMaspyhF7zs9w-Bc65Rsk7bAC1H2Ah66oD_ZEA3p0u7JoEPfR6fi3CcpmDm4tiy3n_E-VZVtVhMwQBTJvJsXlmIGSfUReySVwJRVOcm4_RXz88s80aYuMJ4Ro9NhuRrfPqFZKFk0BQdJDRfpuujKIe5W_kjSXlWKMZ6eqGMrILvKCyGVzKS0VXcTI8Zn6KYIOjJ7LkvviLAE5m6Av83gXX_ohu3DDEYXsvhlTPZz6wmAhYoI6gLkF7vwxyktnDMgwTluk14NewbOOW0-_Rco0Jca3It1EYKYRjfmDopY-vZlj9O-dsuT0UHs",
     "AEC": "AVh_V2g6_xNYYkECwncJ9EJFNnbRfYvCd2tRCeocw5uVyNNabv_BZq8GTQ",
@@ -49,73 +45,35 @@ PREMIUM_COOKIES = {
     "TSID_terabox": "EKrHlY4rFrQXQmbpdntjoIUPovGL6Oeo",
     "TSID_1024tera": "nRUDAK48xNGrKJwAf8mGVrioZ8uiEMbZ",
 }
+COOKIE_STRING = "; ".join([f"{k}={v}" for k,v in PREMIUM_COOKIES.items()])
+COOKIES_DICT = {k:v for k,v in (cookie.split('=',1) for cookie in COOKIE_STRING.split('; ') if '=' in cookie)}
 
-# Cookie string + dict
-cookie_string = "; ".join([f"{k}={v}" for k, v in PREMIUM_COOKIES.items()])
+# --- Fetch initial tokens ---
+def fetch_tokens(share_url):
+    logger.info(f"Fetching tokens for: {share_url}")
+    resp = requests.get(share_url, headers=HEADERS, cookies=COOKIES_DICT, timeout=30)
+    resp.raise_for_status()
+    html = resp.text
 
+    js_token = re.search(r'fn%28%22([0-9A-Fa-f]+)%22%29', html)
+    js_token = js_token.group(1) if js_token else None
 
-def parse_cookies(cookie_string):
-    cookies_dict = {}
-    for cookie in cookie_string.split('; '):
-        if '=' in cookie:
-            key, value = cookie.split('=', 1)
-            cookies_dict[key] = value
-    return cookies_dict
+    dp_logid = re.search(r'"log_id"\s*:\s*"([0-9]+)"', html)
+    if not dp_logid:
+        dp_logid = re.search(r'dp-logid=([0-9]+)', html)
+    dp_logid = dp_logid.group(1) if dp_logid else None
 
+    surl = parse_qs(urlparse(resp.url).query).get('surl', [None])[0]
 
-# Final headers (with cookies)
-HEADERS = BASE_HEADERS.copy()
-HEADERS['Cookie'] = cookie_string
+    if not js_token or not dp_logid or not surl:
+        logger.error(f"Failed to extract tokens: js_token={js_token}, dp_logid={dp_logid}, surl={surl}")
+        raise Exception("Unable to extract necessary tokens")
 
+    return js_token, dp_logid, surl
 
-# --- Resolve to final URL (d8.freeterabox.com) ---
-def resolve_final_url(url):
-    try:
-        resp = requests.get(url, headers=HEADERS, allow_redirects=False, timeout=15)
-        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
-            return resp.headers.get("Location", url)
-        return url
-    except Exception as e:
-        logger.warning(f"Failed to resolve {url}: {e}")
-        return url
-
-
-# --- Fetch initial page and tokens ---
-def fetch_initial_page(share_url):
-    logger.info(f"Fetching initial page: {share_url}")
-    parsed_cookies = parse_cookies(cookie_string)
-    parsed_share_url = urlparse(share_url)
-    initial_headers = BASE_HEADERS.copy()
-    initial_headers['Referer'] = f"{parsed_share_url.scheme}://{parsed_share_url.netloc}/"
-
-    response = requests.get(share_url, headers=initial_headers, cookies=parsed_cookies, timeout=20)
-    response.raise_for_status()
-    html = response.text
-
-    js_token_match = re.search(r'fn%28%22([0-9A-Fa-f]+)%22%29', html)
-    js_token = js_token_match.group(1) if js_token_match else None
-
-    log_id_match = re.search(r'dp-logid=([0-9]+)', html)
-    log_id = log_id_match.group(1) if log_id_match else None
-    if not log_id:
-        log_id_json = re.search(r'"log_id"\s*:\s*"([0-9]+)"', html)
-        log_id = log_id_json.group(1) if log_id_json else None
-
-    final_url_parsed = urlparse(response.url)
-    surl_params = parse_qs(final_url_parsed.query)
-    surl = surl_params.get('surl', [None])[0]
-
-    if not js_token or not log_id or not surl:
-        raise Exception(f"Missing tokens: js_token={js_token}, dp_logid={log_id}, surl={surl}")
-
-    return {"js_token": js_token, "dp_logid": log_id, "surl": surl}
-
-
-# --- Fetch file list from API ---
+# --- Fetch files from API ---
 def fetch_file_list(js_token, dp_logid, surl, dir_path='/'):
-    file_list_api_url = "https://dm.1024tera.com/share/list"
-    parsed_cookies = parse_cookies(cookie_string)
-
+    api_url = "https://dm.1024tera.com/share/list"
     params = {
         'app_id': '250528',
         'web': '1',
@@ -128,91 +86,84 @@ def fetch_file_list(js_token, dp_logid, surl, dir_path='/'):
         'by': 'name',
         'order': 'asc',
         'site_referer': f"https://dm.1024tera.com/sharing/link?surl={surl}&clearCache=1",
-        'shorturl': surl,
+        'shorturl': surl
     }
-
     if dir_path == '/':
         params['root'] = '1'
     else:
         params['dir'] = dir_path
-        params.pop('root', None)
 
-    current_headers = BASE_HEADERS.copy()
-    current_headers['Referer'] = params['site_referer']
-
-    response = requests.get(file_list_api_url, headers=current_headers, cookies=parsed_cookies, params=params, timeout=20)
-    response.raise_for_status()
-    data = response.json()
+    resp = requests.get(api_url, headers=HEADERS, cookies=COOKIES_DICT, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
 
     if data.get('errno') != 0:
         raise Exception(f"API Error: {data.get('errmsg')}")
 
-    file_items = []
+    files = []
     for item in data.get('list', []):
-        raw_url = item.get("dlink")
-        resolved_url = resolve_final_url(raw_url) if raw_url else None
-
-        file_items.append({
+        files.append({
             "file_name": item.get("server_filename"),
             "path": item.get("path"),
             "size": item.get("size", 0),
-            "size_bytes": item.get("size", 0),
-            "download_url": resolved_url,   # ✅ return final d8 link
+            "download_url": item.get("dlink"),
             "is_directory": item.get("isdir", 0) == 1,
             "modify_time": item.get("server_mtime"),
-            "thumbnails": item.get("thumbs", {}),
+            "thumbnails": item.get("thumbs", {})
         })
-    return file_items
+    return files
 
+# --- Resolve final link safely ---
+def resolve_final_link(dlink):
+    if not dlink:
+        return None
+    try:
+        # Use HEAD to resolve redirect without downloading
+        resp = requests.head(dlink, headers=HEADERS, cookies=COOKIES_DICT, allow_redirects=True, timeout=60)
+        return resp.url
+    except Exception as e:
+        logger.error(f"Failed to resolve dlink: {e}")
+        return dlink  # fallback to original link
 
-# --- Process shared content recursively ---
-def process_shared_content(share_url):
-    processed_content = []
-    tokens = fetch_initial_page(share_url)
-    js_token = tokens['js_token']
-    dp_logid = tokens['dp_logid']
-    surl = tokens['surl']
+# --- Process folder recursively ---
+def process_folder(share_url):
+    js_token, dp_logid, surl = fetch_tokens(share_url)
+    results = []
 
-    root_items = fetch_file_list(js_token, dp_logid, surl, dir_path='/')
-
-    def traverse_items(items_list):
-        for item in items_list:
+    def traverse(items):
+        for item in items:
             if item['is_directory']:
                 sub_items = fetch_file_list(js_token, dp_logid, surl, dir_path=item['path'])
-                traverse_items(sub_items)
+                traverse(sub_items)
             else:
-                processed_content.append(item)
+                final_url = resolve_final_link(item['download_url'])
+                results.append({
+                    "file_name": item['file_name'],
+                    "path": item['path'],
+                    "size": item['size'],
+                    "download_url": item['download_url'],
+                    "final_download_url": final_url,
+                    "modify_time": item['modify_time'],
+                    "thumbnails": item['thumbnails']
+                })
 
-    traverse_items(root_items)
-    return processed_content
-
+    root_items = fetch_file_list(js_token, dp_logid, surl)
+    traverse(root_items)
+    return results
 
 # --- Flask Route ---
 @app.route("/terabox/fetch", methods=["GET"])
-def fetch():
+def fetch_route():
     share_url = request.args.get("url")
     if not share_url:
-        return jsonify({
-            "status": "error",
-            "message": "Missing ?url parameter",
-            "developer": "bhookibhabhi"
-        }), 400
-
+        return jsonify({"status":"error","message":"Missing ?url parameter"}), 400
     try:
-        results = process_shared_content(share_url)
-        return jsonify({
-            "status": "success",
-            "files": results,
-            "developer": "bhookibhabhi"
-        })
+        files = process_folder(share_url)
+        return jsonify({"status":"success","files":files})
     except Exception as e:
-        logger.error(f"Error: {e}")
-        return jsonify({
-            "status": "error",
-            "message": str(e),
-            "developer": "bhookibhabhi"
-        }), 500
+        logger.error(str(e))
+        return jsonify({"status":"error","message":str(e)}), 500
 
-# --- Run Flask Server ---
+# --- Run Flask ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True)
