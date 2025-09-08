@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 import requests
 import logging
 import re
-import json
 from urllib.parse import urlparse, parse_qs
 
 # --- Flask App ---
@@ -12,19 +11,14 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Global Headers and Cookies ---
-headers = {
-    'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+# --- Global Headers (no cookies here) ---
+BASE_HEADERS = {
+    'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
     'Accept': "application/json, text/plain, */*",
     'Accept-Encoding': "identity",
-    'sec-ch-ua-platform': "\"Android\"",
     'X-Requested-With': "XMLHttpRequest",
-    'sec-ch_ua': "\"Chromium\";v=\"136\", \"Android WebView\";v=\"136\", \"Not.A/Brand\";v=\"99\"",
     'Content-Type': "application/x-www-form-urlencoded",
-    'sec-ch-ua-mobile': "?1",
-    'Sec-Fetch-Site': "same-origin",
-    'Sec-Fetch-Mode': "cors",
-    'Sec-Fetch-Dest': "empty",
     'Accept-Language': "en-GB,en-US;q=0.9,en;q=0.8",
 }
 
@@ -56,7 +50,8 @@ PREMIUM_COOKIES = {
     "TSID_1024tera": "nRUDAK48xNGrKJwAf8mGVrioZ8uiEMbZ",
 }
 
-cookie_string = "; ".join([f"{key}={value}" for key, value in PREMIUM_COOKIES.items()])
+# Cookie string + dict
+cookie_string = "; ".join([f"{k}={v}" for k, v in PREMIUM_COOKIES.items()])
 
 
 def parse_cookies(cookie_string):
@@ -67,20 +62,36 @@ def parse_cookies(cookie_string):
             cookies_dict[key] = value
     return cookies_dict
 
+
+# Final headers (with cookies)
+HEADERS = BASE_HEADERS.copy()
+HEADERS['Cookie'] = cookie_string
+
+
+# --- Resolve to final URL (d8.freeterabox.com) ---
+def resolve_final_url(url):
+    try:
+        resp = requests.get(url, headers=HEADERS, allow_redirects=False, timeout=15)
+        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+            return resp.headers.get("Location", url)
+        return url
+    except Exception as e:
+        logger.warning(f"Failed to resolve {url}: {e}")
+        return url
+
+
 # --- Fetch initial page and tokens ---
 def fetch_initial_page(share_url):
-    """Fetch dynamic tokens: jsToken, dp-logid, surl"""
     logger.info(f"Fetching initial page: {share_url}")
     parsed_cookies = parse_cookies(cookie_string)
     parsed_share_url = urlparse(share_url)
-    initial_headers = headers.copy()
+    initial_headers = BASE_HEADERS.copy()
     initial_headers['Referer'] = f"{parsed_share_url.scheme}://{parsed_share_url.netloc}/"
 
-    response = requests.get(share_url, headers=initial_headers, cookies=parsed_cookies, timeout=30)
+    response = requests.get(share_url, headers=initial_headers, cookies=parsed_cookies, timeout=20)
     response.raise_for_status()
     html = response.text
 
-    # Extract tokens
     js_token_match = re.search(r'fn%28%22([0-9A-Fa-f]+)%22%29', html)
     js_token = js_token_match.group(1) if js_token_match else None
 
@@ -99,9 +110,9 @@ def fetch_initial_page(share_url):
 
     return {"js_token": js_token, "dp_logid": log_id, "surl": surl}
 
+
 # --- Fetch file list from API ---
 def fetch_file_list(js_token, dp_logid, surl, dir_path='/'):
-    """Fetch files from Terabox API"""
     file_list_api_url = "https://dm.1024tera.com/share/list"
     parsed_cookies = parse_cookies(cookie_string)
 
@@ -126,10 +137,10 @@ def fetch_file_list(js_token, dp_logid, surl, dir_path='/'):
         params['dir'] = dir_path
         params.pop('root', None)
 
-    current_headers = headers.copy()
+    current_headers = BASE_HEADERS.copy()
     current_headers['Referer'] = params['site_referer']
 
-    response = requests.get(file_list_api_url, headers=current_headers, cookies=parsed_cookies, params=params, timeout=30)
+    response = requests.get(file_list_api_url, headers=current_headers, cookies=parsed_cookies, params=params, timeout=20)
     response.raise_for_status()
     data = response.json()
 
@@ -138,27 +149,21 @@ def fetch_file_list(js_token, dp_logid, surl, dir_path='/'):
 
     file_items = []
     for item in data.get('list', []):
+        raw_url = item.get("dlink")
+        resolved_url = resolve_final_url(raw_url) if raw_url else None
+
         file_items.append({
             "file_name": item.get("server_filename"),
             "path": item.get("path"),
             "size": item.get("size", 0),
             "size_bytes": item.get("size", 0),
-            "download_url": item.get("dlink"),
+            "download_url": resolved_url,   # ✅ return final d8 link
             "is_directory": item.get("isdir", 0) == 1,
             "modify_time": item.get("server_mtime"),
-            "thumbnails": item.get("thumbs", {})
+            "thumbnails": item.get("thumbs", {}),
         })
     return file_items
 
-# --- Resolve final download link ---
-def resolve_final_link(dlink):
-    """Resolve final redirected URL (the actual CDN link)"""
-    try:
-        response = requests.get(dlink, allow_redirects=True, headers=headers, timeout=30)
-        return response.url
-    except Exception as e:
-        logger.error(f"Failed to resolve final link: {e}")
-        return dlink
 
 # --- Process shared content recursively ---
 def process_shared_content(share_url):
@@ -176,32 +181,37 @@ def process_shared_content(share_url):
                 sub_items = fetch_file_list(js_token, dp_logid, surl, dir_path=item['path'])
                 traverse_items(sub_items)
             else:
-                processed_content.append({
-                    "file_name": item['file_name'],
-                    "path": item['path'],
-                    "size": item['size'],
-                    "size_bytes": item['size_bytes'],
-                    "download_url": item['download_url'],
-                    "final_download_url": resolve_final_link(item['download_url']),
-                    "modify_time": item['modify_time'],
-                    "thumbnails": item['thumbnails']
-                })
+                processed_content.append(item)
 
     traverse_items(root_items)
     return processed_content
+
 
 # --- Flask Route ---
 @app.route("/terabox/fetch", methods=["GET"])
 def fetch():
     share_url = request.args.get("url")
     if not share_url:
-        return jsonify({"status": "error", "message": "Missing ?url parameter"}), 400
+        return jsonify({
+            "status": "error",
+            "message": "Missing ?url parameter",
+            "developer": "bhookibhabhi"
+        }), 400
 
     try:
         results = process_shared_content(share_url)
-        return jsonify({"status": "success", "files": results})
+        return jsonify({
+            "status": "success",
+            "files": results,
+            "developer": "bhookibhabhi"
+        })
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"Error: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "developer": "bhookibhabhi"
+        }), 500
 
 # --- Run Flask Server ---
 if __name__ == "__main__":
